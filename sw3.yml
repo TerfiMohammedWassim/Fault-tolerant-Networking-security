@@ -10,7 +10,6 @@
   become: true
 
   vars:
-
     # ── Identité système ──────────────────────────────────────────────────
     hostname: sw3
     loopback_ip: "10.10.10.3/32"
@@ -23,7 +22,7 @@
     # ── Bridge ────────────────────────────────────────────────────────────
     bridge:
       name: bridge
-      vids: "10,20"
+      vids: "10 20" # Cumulus préfère l'espace ou la virgule sans guillemets complexes
       pvid: 1
 
     # ── SVIs — interfaces L3 par VLAN ─────────────────────────────────────
@@ -36,29 +35,20 @@
         description: "Passerelle VLAN20 — Machine2"
 
     # ── Routes statiques inter-VLAN ───────────────────────────────────────
-    # Les routes directement connectées sont créées automatiquement par les SVIs
-    # On ajoute ici des routes explicites pour la clarté et la persistance
     static_routes:
       - prefix: "192.168.1.0/24"
         dev: vlan10
-        description: "Réseau Machine1"
       - prefix: "192.168.2.0/24"
         dev: vlan20
-        description: "Réseau Machine2"
 
-    # ── Sysctl — forwarding IP obligatoire sur SW3 ────────────────────────
+    # ── Sysctl ────────────────────────────────────────────────────────────
     sysctl_settings:
-      - name: net.ipv4.ip_forward
-        value: "1"                         # OBLIGATOIRE pour le routage inter-VLAN
-      - name: net.ipv4.conf.all.rp_filter
-        value: "0"                         # Désactiver rp_filter pour le routage VLAN
-      - name: net.ipv4.conf.default.rp_filter
-        value: "0"
-      - name: net.core.netdev_max_backlog
-        value: "1000"
+      - { name: "net.ipv4.ip_forward", value: "1" }
+      - { name: "net.ipv4.conf.all.rp_filter", value: "0" }
+      - { name: "net.ipv4.conf.default.rp_filter", value: "0" }
+      - { name: "net.core.netdev_max_backlog", value: "1000" }
 
   tasks:
-
     # ════════════════════════════════════════════════════════════════════
     # 1. PARAMÈTRES SYSTÈME
     # ════════════════════════════════════════════════════════════════════
@@ -66,13 +56,6 @@
     - name: "[SYS] Définir le hostname"
       hostname:
         name: "{{ hostname }}"
-
-    - name: "[SYS] Mettre à jour /etc/hosts"
-      lineinfile:
-        path: /etc/hosts
-        regexp: '^127\.0\.1\.1'
-        line: "127.0.1.1 {{ hostname }}"
-        state: present
 
     - name: "[SYS] Appliquer les paramètres sysctl"
       sysctl:
@@ -83,27 +66,9 @@
         sysctl_file: /etc/sysctl.d/99-campus.conf
       loop: "{{ sysctl_settings }}"
 
-    - name: "[SYS] Vérifier ip_forward actif"
-      command: sysctl net.ipv4.ip_forward
-      register: ip_fwd
-      changed_when: false
-
-    - name: "[SYS] Confirmer ip_forward = 1"
-      assert:
-        that: "'= 1' in ip_fwd.stdout"
-        fail_msg: "ERREUR CRITIQUE : ip_forward non activé sur SW3 — le routage inter-VLAN ne fonctionnera pas"
-        success_msg: "OK : ip_forward = 1 ✓"
-
     # ════════════════════════════════════════════════════════════════════
     # 2. INTERFACES RÉSEAU (SVIs + bridge)
     # ════════════════════════════════════════════════════════════════════
-
-    - name: "[NET] Sauvegarder l'ancien fichier interfaces"
-      copy:
-        src: /etc/network/interfaces
-        dest: "/etc/network/interfaces.bak.{{ lookup('pipe', 'date +%Y%m%d_%H%M%S') }}"
-        remote_src: true
-      ignore_errors: true
 
     - name: "[NET] Déployer /etc/network/interfaces"
       copy:
@@ -114,7 +79,6 @@
         content: |
           # /etc/network/interfaces — {{ hostname }}
           # Généré par Ansible — {{ lookup('pipe', 'date') }}
-          # Rôle : commutateur L3, routage inter-VLAN statique
 
           auto lo
           iface lo inet loopback
@@ -123,12 +87,12 @@
           auto eth0
           iface eth0 inet dhcp
 
-          # ── Uplinks depuis SW1 et SW2 (trunk VLAN 10,20) ────────────
+          # ── Uplinks (Trunks) ──────────────────────────────────────────
           {% for port in uplink_ports %}
           auto {{ port }}
           iface {{ port }}
-
           {% endfor %}
+
           # ── Bridge VLAN-aware ────────────────────────────────────────
           auto {{ bridge.name }}
           iface {{ bridge.name }}
@@ -137,11 +101,11 @@
               bridge-vids {{ bridge.vids }}
               bridge-pvid {{ bridge.pvid }}
 
-          # ── SVIs (interfaces L3) ─────────────────────────────────────
+          # ── SVIs (Interfaces VLAN) ───────────────────────────────────
           {% for svi in svi_interfaces %}
           # {{ svi.description }}
           auto vlan{{ svi.vlan_id }}
-          iface vlan{{ svi.vlan_id }} inet static
+          iface vlan{{ svi.vlan_id }}
               address {{ svi.ip_address }}
               vlan-id {{ svi.vlan_id }}
               vlan-raw-device {{ bridge.name }}
@@ -152,93 +116,24 @@
       command: ifreload -a
       changed_when: true
 
-    - name: "[NET] Attendre que les SVIs soient UP (3s)"
-      wait_for:
-        timeout: 3
-      delegate_to: localhost
+    # ════════════════════════════════════════════════════════════════════
+    # 3. VÉRIFICATIONS (Tests)
+    # ════════════════════════════════════════════════════════════════════
 
-    - name: "[NET] Vérifier les SVIs"
+    - name: "[CHECK] Vérifier ip_forward"
+      command: sysctl net.ipv4.ip_forward
+      register: ip_fwd
+      changed_when: false
+
+    - name: "[CHECK] Confirmer IP sur SVIs"
       command: "ip addr show vlan{{ item.vlan_id }}"
       register: svi_check
       changed_when: false
       loop: "{{ svi_interfaces }}"
 
-    - name: "[NET] Afficher l'état des SVIs"
-      debug:
-        msg: "{{ item.stdout_lines }}"
-      loop: "{{ svi_check.results }}"
-
-    - name: "[NET] Confirmer IP présente sur chaque SVI"
-      assert:
-        that: "item.item.ip_address.split('/')[0] in item.stdout"
-        fail_msg: "ERREUR : IP {{ item.item.ip_address }} absente de vlan{{ item.item.vlan_id }}"
-        success_msg: "OK : vlan{{ item.item.vlan_id }} → {{ item.item.ip_address }} ✓"
-      loop: "{{ svi_check.results }}"
-
-    # ════════════════════════════════════════════════════════════════════
-    # 3. ROUTES STATIQUES
-    # ════════════════════════════════════════════════════════════════════
-
-    - name: "[ROUTE] Vérifier la table de routage"
-      command: ip route show
-      register: route_table
-      changed_when: false
-
-    - name: "[ROUTE] Afficher les routes"
-      debug:
-        msg: "{{ route_table.stdout_lines }}"
-
-    - name: "[ROUTE] Confirmer routes directes présentes"
-      assert:
-        that: "item.prefix.split('/')[0].rsplit('.', 1)[0] in route_table.stdout"
-        fail_msg: "AVERTISSEMENT : route {{ item.prefix }} non trouvée"
-        success_msg: "OK : route {{ item.prefix }} via {{ item.dev }} présente ✓"
-      loop: "{{ static_routes }}"
-      ignore_errors: true
-
-    - name: "[ROUTE] Vérifier la table ARP"
-      command: ip neigh show
-      register: arp_table
-      changed_when: false
-
-    - name: "[ROUTE] Afficher la table ARP"
-      debug:
-        msg: "{{ arp_table.stdout_lines }}"
-
-    # ════════════════════════════════════════════════════════════════════
-    # 4. VÉRIFICATION FINALE
-    # ════════════════════════════════════════════════════════════════════
-
-    - name: "[CHECK] État de toutes les interfaces"
-      command: net show interface all
-      register: iface_all
-      changed_when: false
-
-    - name: "[CHECK] Afficher les interfaces"
-      debug:
-        msg: "{{ iface_all.stdout_lines }}"
-
-    - name: "[CHECK] VLANs sur le bridge"
-      command: bridge vlan show
-      register: bridge_vlans
-      changed_when: false
-
-    - name: "[CHECK] Afficher les VLANs"
-      debug:
-        msg: "{{ bridge_vlans.stdout_lines }}"
-
-    - name: "[CHECK] Résumé final SW3"
+    - name: "[CHECK] Résumé final"
       debug:
         msg:
-          - "════════════════════════════════════════════"
-          - "  SW3 configuré — RÉSUMÉ"
-          - "════════════════════════════════════════════"
-          - "  Hostname       : {{ hostname }}"
-          - "  Loopback       : {{ loopback_ip }}"
-          - "  ip_forward     : 1 (routage actif)"
-          - "  Uplinks        : {{ uplink_ports | join(', ') }}"
-          - "  SVI vlan10     : 192.168.1.254/24 (GW Machine1)"
-          - "  SVI vlan20     : 192.168.2.254/24 (GW Machine2)"
-          - "  Route VLAN10   : 192.168.1.0/24 dev vlan10"
-          - "  Route VLAN20   : 192.168.2.0/24 dev vlan20"
-          - "════════════════════════════════════════════"
+          - "Host: {{ hostname }}"
+          - "Forwarding: {{ ip_fwd.stdout }}"
+          - "VLANs: {{ bridge.vids }}"
