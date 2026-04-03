@@ -1,0 +1,224 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# PLAYBOOK AUTONOME — SW1 (Cumulus VX 4.x)
+# Rôle : Access switch MLAG primary
+# Interfaces : swp1  → host-only  (OOB mgmt)
+#              swp2  → LAN1       (M1 ens33 — bond_m1 VLAN10)
+#              swp3  → LAN3       (M2 ens33 — bond_m2 VLAN20)
+#              swp4  → LAN5       (peerlink SW1↔SW2 membre 1)
+#              swp5  → LAN6       (peerlink SW1↔SW2 membre 2)
+#              swp6  → LAN7       (uplink SW3 swp2)
+#              swp7  → LAN11      (uplink SW4 swp2)
+# Usage : ansible-playbook -i /etc/ansible/hosts sw1.yml
+# ═══════════════════════════════════════════════════════════════════════════
+---
+- name: Configuration complète SW1
+  hosts: sw1
+  gather_facts: false
+  become: true
+
+  vars:
+
+    hostname: sw1
+    loopback_ip: "10.10.10.1/32"
+
+    mlag:
+      role: primary
+      sys_mac: "44:38:39:FF:01:01"
+      peerlink_name: peerlink
+      peerlink_members:
+        - swp4                       # LAN5
+        - swp5                       # LAN6
+      peerlink_ip: "169.254.1.1/30"
+      peer_ip: "169.254.1.2"
+      backup_ip: "10.10.10.2"
+      keepalive_ip: "10.10.10.1/32"
+
+    mlag_bonds:
+      - name: bond_m1
+        slave: swp2                  # LAN1 → M1 ens33
+        clag_id: 1
+        vlan: 10
+      - name: bond_m2
+        slave: swp3                  # LAN3 → M2 ens33
+        clag_id: 2
+        vlan: 20
+
+    # Deux uplinks vers le core — SW3 et SW4 pour la redondance
+    uplink_ports:
+      - swp6                         # LAN7 → SW3 swp2
+      - swp7                         # LAN11 → SW4 swp2
+
+    bridge:
+      name: bridge
+      vids: "10,20"
+      pvid: 1
+
+    sysctl_settings:
+      - { name: net.ipv4.ip_forward,         value: "0" }
+      - { name: net.core.netdev_max_backlog,  value: "1000" }
+
+  tasks:
+
+    # ════════════════════════════════════════════════════════════════════
+    # 1. PARAMÈTRES SYSTÈME
+    # ════════════════════════════════════════════════════════════════════
+
+    - name: "[SYS] Appliquer les paramètres sysctl"
+      raw: |
+        mkdir -p /etc/sysctl.d
+        sysctl -w net.ipv4.ip_forward=0
+        sysctl -w net.core.netdev_max_backlog=1000
+        printf 'net.ipv4.ip_forward = 0\nnet.core.netdev_max_backlog = 1000\n' \
+          > /etc/sysctl.d/99-campus.conf
+      changed_when: true
+
+    # ════════════════════════════════════════════════════════════════════
+    # 2. INTERFACES RÉSEAU
+    # ════════════════════════════════════════════════════════════════════
+
+    - name: "[NET] Sauvegarder /etc/network/interfaces"
+      raw: cp /etc/network/interfaces /etc/network/interfaces.bak.$(date +%Y%m%d_%H%M%S) 2>/dev/null || true
+      changed_when: true
+
+    - name: "[NET] Déployer /etc/network/interfaces"
+      raw: |
+        cat > /etc/network/interfaces << 'EOF'
+        auto lo
+        iface lo inet loopback
+            address 10.10.10.1/32
+
+        auto eth0
+        iface eth0 inet dhcp
+
+        auto swp1
+        iface swp1 inet dhcp
+
+        # ── Peerlink membres ──────────────────────────────────────────
+        auto swp4
+        iface swp4
+
+        auto swp5
+        iface swp5
+
+        # ── Peerlink bond SW1 ↔ SW2 ──────────────────────────────────
+        auto peerlink
+        iface peerlink
+            bond-slaves swp4 swp5
+            bond-mode 802.3ad
+            bond-miimon 100
+            bond-lacp-rate fast
+            bond-min-links 1
+
+        # ── Sous-interface MLAG ───────────────────────────────────────
+        auto peerlink.4094
+        iface peerlink.4094
+            clagd-enable yes
+            clagd-peer-ip 169.254.1.2
+            clagd-backup-ip 10.10.10.2
+            clagd-sys-mac 44:38:39:FF:01:01
+            address 169.254.1.1/30
+
+        # ── Ports accès ───────────────────────────────────────────────
+        auto swp2
+        iface swp2
+
+        auto swp3
+        iface swp3
+
+        # ── Bond MLAG machine1 (VLAN10) ───────────────────────────────
+        auto bond_m1
+        iface bond_m1
+            bond-slaves swp2
+            bond-mode 802.3ad
+            bond-miimon 100
+            bond-lacp-rate fast
+            bond-min-links 1
+            clag-id 1
+            bridge-access 10
+
+        # ── Bond MLAG machine2 (VLAN20) ───────────────────────────────
+        auto bond_m2
+        iface bond_m2
+            bond-slaves swp3
+            bond-mode 802.3ad
+            bond-miimon 100
+            bond-lacp-rate fast
+            bond-min-links 1
+            clag-id 2
+            bridge-access 20
+
+        # ── Uplinks vers SW3 et SW4 (trunk VLAN10,20) ────────────────
+        auto swp6
+        iface swp6
+
+        auto swp7
+        iface swp7
+
+        # ── Bridge VLAN-aware ─────────────────────────────────────────
+        auto bridge
+        iface bridge
+            bridge-vlan-aware yes
+            bridge-ports bond_m1 bond_m2 peerlink swp6 swp7
+            bridge-vids 10,20
+            bridge-pvid 1
+        EOF
+      changed_when: true
+
+    # ════════════════════════════════════════════════════════════════════
+    # 3. RECHARGEMENT ET MLAG
+    # ════════════════════════════════════════════════════════════════════
+
+    - name: "[MLAG] Recharger les interfaces"
+      command: ifreload -a
+      changed_when: true
+
+    - name: "[MLAG] Attendre le démarrage de clagd (8s)"
+      wait_for:
+        timeout: 8
+      delegate_to: localhost
+
+    - name: "[MLAG] Vérifier l'état clagd"
+      command: clagctl status
+      register: clag_status
+      changed_when: false
+      ignore_errors: true
+
+    - name: "[MLAG] Afficher l'état MLAG"
+      debug:
+        msg: "{{ clag_status.stdout_lines }}"
+
+    - name: "[MLAG] Vérifier que le peer SW2 est alive"
+      assert:
+        that: "'peer is alive' in clag_status.stdout"
+        fail_msg: "AVERTISSEMENT : peer SW2 non détecté"
+        success_msg: "OK : peer SW2 détecté ✓"
+      ignore_errors: true
+
+    # ════════════════════════════════════════════════════════════════════
+    # 4. VÉRIFICATION FINALE
+    # ════════════════════════════════════════════════════════════════════
+
+    - name: "[CHECK] VLANs sur le bridge"
+      command: bridge vlan show
+      register: bridge_vlans
+      changed_when: false
+
+    - name: "[CHECK] Afficher les VLANs"
+      debug:
+        msg: "{{ bridge_vlans.stdout_lines }}"
+
+    - name: "[CHECK] Résumé final SW1"
+      debug:
+        msg:
+          - "════════════════════════════════════"
+          - "  SW1 configuré — RÉSUMÉ"
+          - "════════════════════════════════════"
+          - "  Hostname    : {{ hostname }}"
+          - "  Loopback    : {{ loopback_ip }}"
+          - "  MLAG rôle   : {{ mlag.role }}"
+          - "  Peerlink    : swp4+swp5 (LAN5+LAN6)"
+          - "  bond_m1     : swp2 → VLAN10 (M1)"
+          - "  bond_m2     : swp3 → VLAN20 (M2)"
+          - "  Uplink SW3  : swp6 (LAN7)"
+          - "  Uplink SW4  : swp7 (LAN11)"
+          - "════════════════════════════════════"

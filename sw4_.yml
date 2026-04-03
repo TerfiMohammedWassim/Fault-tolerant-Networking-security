@@ -1,0 +1,279 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# PLAYBOOK AUTONOME — SW4 (Cumulus VX 4.x)
+# Rôle : Core switch L3 — VRRP backup, routage inter-VLAN
+# Interfaces : swp1  → host-only  (OOB mgmt)
+#              swp2  → LAN11      (uplink depuis SW1 swp7)
+#              swp3  → LAN12      (uplink depuis SW2 swp7)
+#              swp4  → LAN9       (inter-core bond vers SW3 membre 1)
+#              swp5  → LAN10      (inter-core bond vers SW3 membre 2)
+#
+# VRRP : SW4 est backup (priorité 100)
+#   vlan10 : real IP 192.168.1.252/24 — VIP 192.168.1.254 (gateway M1)
+#   vlan20 : real IP 192.168.2.252/24 — VIP 192.168.2.254 (gateway M2)
+# Inter-core bond : 10.10.20.2/30 ↔ SW3 10.10.20.1/30
+# Usage : ansible-playbook -i /etc/ansible/hosts sw4.yml
+# ═══════════════════════════════════════════════════════════════════════════
+---
+- name: Configuration complète SW4
+  hosts: sw4
+  gather_facts: false
+  become: true
+
+  vars:
+
+    hostname: sw4
+    loopback_ip: "10.10.10.4/32"
+
+    uplink_ports:
+      - swp2                         # LAN11 ← SW1 swp7
+      - swp3                         # LAN12 ← SW2 swp7
+
+    intercore:
+      bond_name: bond_core
+      members:
+        - swp4                       # LAN9
+        - swp5                       # LAN10
+      ip: "10.10.20.2/30"
+      peer_ip: "10.10.20.1"         # SW3
+
+    bridge:
+      name: bridge
+      vids: "10,20"
+      pvid: 1
+
+    svi_interfaces:
+      - vlan_id: 10
+        ip_address: "192.168.1.252/24"   # IP réelle SW4 — VIP = .254 via VRRP
+        vrrp_group: 10
+        vrrp_vip: "192.168.1.254/24"
+        vrrp_priority: 100               # backup — SW3 est master
+        description: "Passerelle VLAN10 — Machine1 (backup)"
+      - vlan_id: 20
+        ip_address: "192.168.2.252/24"
+        vrrp_group: 20
+        vrrp_vip: "192.168.2.254/24"
+        vrrp_priority: 100
+        description: "Passerelle VLAN20 — Machine2 (backup)"
+
+    sysctl_settings:
+      - { name: net.ipv4.ip_forward,              value: "1" }
+      - { name: net.ipv4.conf.all.rp_filter,       value: "0" }
+      - { name: net.ipv4.conf.default.rp_filter,   value: "0" }
+      - { name: net.core.netdev_max_backlog,        value: "1000" }
+
+  tasks:
+
+    # ════════════════════════════════════════════════════════════════════
+    # 1. PARAMÈTRES SYSTÈME
+    # ════════════════════════════════════════════════════════════════════
+
+    - name: "[SYS] Appliquer les paramètres sysctl"
+      raw: |
+        mkdir -p /etc/sysctl.d
+        sysctl -w net.ipv4.ip_forward=1
+        sysctl -w net.ipv4.conf.all.rp_filter=0
+        sysctl -w net.ipv4.conf.default.rp_filter=0
+        sysctl -w net.core.netdev_max_backlog=1000
+        printf 'net.ipv4.ip_forward = 1\nnet.ipv4.conf.all.rp_filter = 0\nnet.ipv4.conf.default.rp_filter = 0\nnet.core.netdev_max_backlog = 1000\n' \
+          > /etc/sysctl.d/99-campus.conf
+      changed_when: true
+
+    - name: "[SYS] Vérifier ip_forward actif"
+      command: sysctl net.ipv4.ip_forward
+      register: ip_fwd
+      changed_when: false
+
+    - name: "[SYS] Confirmer ip_forward = 1"
+      assert:
+        that: "'= 1' in ip_fwd.stdout"
+        fail_msg: "ERREUR CRITIQUE : ip_forward non activé"
+        success_msg: "OK : ip_forward = 1 ✓"
+
+    # ════════════════════════════════════════════════════════════════════
+    # 2. INTERFACES RÉSEAU
+    # ════════════════════════════════════════════════════════════════════
+
+    - name: "[NET] Sauvegarder /etc/network/interfaces"
+      raw: cp /etc/network/interfaces /etc/network/interfaces.bak.$(date +%Y%m%d_%H%M%S) 2>/dev/null || true
+      changed_when: true
+
+    - name: "[NET] Déployer /etc/network/interfaces"
+      raw: |
+        cat > /etc/network/interfaces << 'EOF'
+        auto lo
+        iface lo inet loopback
+            address 10.10.10.4/32
+
+        auto eth0
+        iface eth0 inet dhcp
+
+        auto swp1
+        iface swp1 inet dhcp
+
+        # ── Uplinks depuis SW1 (LAN11) et SW2 (LAN12) ────────────────
+        auto swp2
+        iface swp2
+
+        auto swp3
+        iface swp3
+
+        # ── Bridge VLAN-aware (uplinks trunk VLAN10,20) ───────────────
+        auto bridge
+        iface bridge
+            bridge-vlan-aware yes
+            bridge-ports swp2 swp3
+            bridge-vids 10,20
+            bridge-pvid 1
+
+        # ── SVI VLAN10 — passerelle Machine1 (backup) ────────────────
+        # IP réelle : 192.168.1.252 | VIP VRRP : 192.168.1.254
+        auto vlan10
+        iface vlan10 inet static
+            address 192.168.1.252/24
+            vlan-id 10
+            vlan-raw-device bridge
+            vrrp 10 192.168.1.254/24
+            vrrp 10 priority 100
+            vrrp 10 advert-interval 1
+            vrrp 10 preempt yes
+
+        # ── SVI VLAN20 — passerelle Machine2 (backup) ────────────────
+        # IP réelle : 192.168.2.252 | VIP VRRP : 192.168.2.254
+        auto vlan20
+        iface vlan20 inet static
+            address 192.168.2.252/24
+            vlan-id 20
+            vlan-raw-device bridge
+            vrrp 20 192.168.2.254/24
+            vrrp 20 priority 100
+            vrrp 20 advert-interval 1
+            vrrp 20 preempt yes
+
+        # ── Inter-core bond vers SW3 (LAN9+LAN10) ────────────────────
+        auto swp4
+        iface swp4
+
+        auto swp5
+        iface swp5
+
+        auto bond_core
+        iface bond_core inet static
+            address 10.10.20.2/30
+            bond-slaves swp4 swp5
+            bond-mode 802.3ad
+            bond-miimon 100
+            bond-lacp-rate fast
+            bond-min-links 1
+            post-up ip route add 192.168.1.0/24 via 10.10.20.1 metric 200 || true
+            post-up ip route add 192.168.2.0/24 via 10.10.20.1 metric 200 || true
+        EOF
+      changed_when: true
+
+    - name: "[NET] Recharger les interfaces"
+      command: ifreload -a
+      changed_when: true
+
+    - name: "[NET] Attendre que les SVIs soient UP (5s)"
+      wait_for:
+        timeout: 5
+      delegate_to: localhost
+
+    # ════════════════════════════════════════════════════════════════════
+    # 3. VÉRIFICATION SVIs ET VRRP
+    # ════════════════════════════════════════════════════════════════════
+
+    - name: "[NET] Vérifier les SVIs"
+      command: "ip addr show vlan{{ item.vlan_id }}"
+      register: svi_check
+      changed_when: false
+      loop: "{{ svi_interfaces }}"
+
+    - name: "[NET] Afficher l'état des SVIs"
+      debug:
+        msg: "{{ item.stdout_lines }}"
+      loop: "{{ svi_check.results }}"
+
+    - name: "[NET] Confirmer IP réelle présente sur chaque SVI"
+      assert:
+        that: "item.item.ip_address.split('/')[0] in item.stdout"
+        fail_msg: "ERREUR : IP {{ item.item.ip_address }} absente de vlan{{ item.item.vlan_id }}"
+        success_msg: "OK : vlan{{ item.item.vlan_id }} → {{ item.item.ip_address }} ✓"
+      loop: "{{ svi_check.results }}"
+
+    - name: "[VRRP] Vérifier l'état VRRP"
+      command: vrrpctl status
+      register: vrrp_status
+      changed_when: false
+      ignore_errors: true
+
+    - name: "[VRRP] Afficher l'état VRRP"
+      debug:
+        msg: "{{ vrrp_status.stdout_lines }}"
+
+    - name: "[VRRP] Confirmer SW4 est VRRP backup"
+      assert:
+        that: "'Backup' in vrrp_status.stdout"
+        fail_msg: "AVERTISSEMENT : SW4 n'est pas en état Backup (vérifier si SW3 est actif)"
+        success_msg: "OK : SW4 est VRRP backup ✓"
+      ignore_errors: true
+
+    # ════════════════════════════════════════════════════════════════════
+    # 4. INTER-CORE
+    # ════════════════════════════════════════════════════════════════════
+
+    - name: "[CORE] Vérifier bond_core"
+      command: ip addr show bond_core
+      register: bond_core_status
+      changed_when: false
+
+    - name: "[CORE] Afficher bond_core"
+      debug:
+        msg: "{{ bond_core_status.stdout_lines }}"
+
+    - name: "[CORE] Ping SW3 via inter-core"
+      command: ping -c 3 -W 2 {{ intercore.peer_ip }}
+      register: ping_sw3
+      changed_when: false
+      ignore_errors: true
+
+    - name: "[CORE] Résultat ping SW3"
+      debug:
+        msg: "{{ ping_sw3.stdout_lines[-3:] if ping_sw3.stdout_lines is defined else 'SW3 non joignable' }}"
+
+    # ════════════════════════════════════════════════════════════════════
+    # 5. VÉRIFICATION FINALE
+    # ════════════════════════════════════════════════════════════════════
+
+    - name: "[CHECK] Table de routage"
+      command: ip route show
+      register: route_table
+      changed_when: false
+
+    - name: "[CHECK] Afficher les routes"
+      debug:
+        msg: "{{ route_table.stdout_lines }}"
+
+    - name: "[CHECK] VLANs sur le bridge"
+      command: bridge vlan show
+      register: bridge_vlans
+      changed_when: false
+
+    - name: "[CHECK] Afficher les VLANs"
+      debug:
+        msg: "{{ bridge_vlans.stdout_lines }}"
+
+    - name: "[CHECK] Résumé final SW4"
+      debug:
+        msg:
+          - "════════════════════════════════════════════"
+          - "  SW4 configuré — RÉSUMÉ"
+          - "════════════════════════════════════════════"
+          - "  Hostname       : {{ hostname }}"
+          - "  Loopback       : {{ loopback_ip }}"
+          - "  ip_forward     : 1 (routage actif)"
+          - "  Uplinks        : swp2 (SW1/LAN11), swp3 (SW2/LAN12)"
+          - "  SVI vlan10     : 192.168.1.252/24 — VIP 192.168.1.254 (VRRP backup)"
+          - "  SVI vlan20     : 192.168.2.252/24 — VIP 192.168.2.254 (VRRP backup)"
+          - "  Inter-core     : bond_core 10.10.20.2/30 → SW3"
+          - "  Ping SW3       : {{ '0% loss ✓' if ping_sw3.rc == 0 else 'non joignable' }}"
+          - "════════════════════════════════════════════"
