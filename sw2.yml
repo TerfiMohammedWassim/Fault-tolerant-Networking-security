@@ -19,8 +19,8 @@
       sys_mac: "44:38:39:FF:01:01"       # identique à SW1 — obligatoire
       peerlink_name: peerlink
       peerlink_members:
-        - swp1
-        - swp2
+        - swp4
+        - swp5
       peerlink_ip: "169.254.1.2/30"      # inversé par rapport à SW1
       peer_ip: "169.254.1.1"             # inversé par rapport à SW1
       backup_ip: "10.10.10.1"            # inversé par rapport à SW1
@@ -28,15 +28,15 @@
 
     mlag_bonds:
       - name: bond_m1
-        slave: swp3
+        slave: swp2
         clag_id: 1
         vlan: 10
       - name: bond_m2
-        slave: swp4
+        slave: swp3
         clag_id: 2
         vlan: 20
 
-    uplink_port: swp5
+    uplink_port: swp6
 
     bridge:
       name: bridge
@@ -282,7 +282,7 @@
           - "  Peerlink    : {{ mlag.peerlink_members | join('+') }}"
           - "  Peer IP     : {{ mlag.peer_ip }}"
           - "  Backup IP   : {{ mlag.backup_ip }}"
-          - "  bond_m1     : swp3 → VLAN10"
-          - "  bond_m2     : swp4 → VLAN20"
+          - "  bond_m1     : swp2 → VLAN10"
+          - "  bond_m2     : swp3 → VLAN20"
           - "  Uplink SW3  : {{ uplink_port }}"
           - "════════════════════════════════════"

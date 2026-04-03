@@ -1,7 +1,7 @@
 # ═══════════════════════════════════════════════════════════════════════════
 # PLAYBOOK AUTONOME — SW3 (Cumulus VX 4.x)
 # Rôle : Core switch L3 — routage inter-VLAN par routes statiques
-# Usage : ansible-playbook -i "IP_SW3," sw3.yml -u cumulus -k --become
+# Usage : ansible-playbook -i /etc/ansible/hosts sw3.yml
 # ═══════════════════════════════════════════════════════════════════════════
 ---
 - name: Configuration complète SW3
@@ -16,8 +16,8 @@
 
     # ── Uplinks depuis SW1 et SW2 ─────────────────────────────────────────
     uplink_ports:
-      - swp1    # vers SW1 swp5
-      - swp2    # vers SW2 swp5
+      - swp2    # vers SW1 swp6
+      - swp3    # vers SW2 swp6
 
     # ── Bridge ────────────────────────────────────────────────────────────
     bridge:

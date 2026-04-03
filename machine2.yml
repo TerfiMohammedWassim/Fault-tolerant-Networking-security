@@ -1,7 +1,7 @@
 # ═══════════════════════════════════════════════════════════════════════════
 # PLAYBOOK AUTONOME — Machine2 (Debian/Ubuntu)
-# Rôle : Hôte avec bond LACP dual-homed vers SW1 (swp4) et SW2 (swp4)
-# Usage : ansible-playbook -i "IP_M2," machine2.yml -u debian -k --become
+# Rôle : Hôte avec bond LACP dual-homed vers SW1 (swp3) et SW2 (swp3)
+# Usage : ansible-playbook -i /etc/ansible/hosts machine2.yml
 # ═══════════════════════════════════════════════════════════════════════════
 ---
 - name: Configuration complète Machine2
@@ -16,12 +16,12 @@
 
     # ── Bond LACP ─────────────────────────────────────────────────────────
     bond:
-      name: bond0
+      name: bond1
       ip: "192.168.2.1/24"
       gateway: "192.168.2.254"       # SVI VLAN20 sur SW3
       members:
-        - eth0                       # vers SW1 swp4
-        - eth1                       # vers SW2 swp4
+        - ens33                       # vers SW1 swp3
+        - ens34                       # vers SW2 swp3
       mode: "802.3ad"
       miimon: 100
       lacp_rate: fast
