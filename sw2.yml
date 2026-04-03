@@ -170,6 +170,8 @@
               bridge-ports {{ mlag_bonds | map(attribute='name') | join(' ') }} {{ mlag.peerlink_name }} {{ uplink_port }}
               bridge-vids {{ bridge.vids }}
               bridge-pvid {{ bridge.pvid }}
+              post-up bridge vlan add dev {{ bridge.name }} vid 10 self
+              post-up bridge vlan add dev {{ bridge.name }} vid 20 self
               post-up ip route replace 192.168.1.0/24 dev {{ bridge.name }} || true
               post-up ip route replace 192.168.2.0/24 dev {{ bridge.name }} || true
       become: true
